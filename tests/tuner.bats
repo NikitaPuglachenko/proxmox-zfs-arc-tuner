@@ -12,27 +12,69 @@ setup() {
 REC_MIN=$((3 * 1073741824))
 REC_MAX=$((12 * 1073741824))
 
+# The kernel currently has other limits than the recommendation
 set_storage() {
     export FAKE_POOL_BYTES=$((7 * TIB / 2))
+    write_arcstats size=$((2 * GIB)) c_min=$((1 * GIB)) c_max=$((8 * GIB))
+}
+
+# The kernel already runs with the recommended limits
+set_applied() {
+    export FAKE_POOL_BYTES=$((7 * TIB / 2))
     write_arcstats size=$((2 * GIB)) c_min="$REC_MIN" c_max="$REC_MAX"
+    echo "$REC_MIN" >"${ZFS_PARAMS_DIR}/zfs_arc_min"
+    echo "$REC_MAX" >"${ZFS_PARAMS_DIR}/zfs_arc_max"
 }
 
 # Sizing
 
 @test "recommendation: min is 50% and max 2x of the baseline" {
     run recommend_limits $((256 * GIB)) $((7 * TIB / 2))
-    [ "$output" = "$REC_MIN $REC_MAX $((6 * GIB)) 0" ]
+    [ "$output" = "$REC_MIN $REC_MAX $((6 * GIB)) formula" ]
 }
 
 @test "recommendation: without pools the baseline is 2 GiB" {
     run recommend_limits $((256 * GIB)) 0
-    [ "$output" = "$((1 * GIB)) $((4 * GIB)) $((2 * GIB)) 0" ]
+    [ "$output" = "$((1 * GIB)) $((4 * GIB)) $((2 * GIB)) formula" ]
 }
 
 @test "recommendation: max is capped to 10% of RAM and min set to 25% of it" {
     run recommend_limits $((64 * GIB)) $((7 * TIB / 2))
     local cap=$((64 * GIB / 10))
-    [ "$output" = "$((cap / 4)) $cap $((6 * GIB)) 1" ]
+    [ "$output" = "$((cap / 4)) $cap $((6 * GIB)) ram_cap" ]
+}
+
+@test "recommendation: max is limited to the memory left after the guests" {
+    # 64 GiB RAM, 56 GiB for guests, 5% (3.2 GiB) reserved for the host: 4.8 GiB left
+    local headroom=$((64 * GIB - 56 * GIB - 64 * GIB / 20))
+    run recommend_limits $((64 * GIB)) $((7 * TIB / 2)) $((56 * GIB))
+    [ "$output" = "$((32 * 1048576)) $headroom $((6 * GIB)) guests" ]
+}
+
+@test "recommendation: guests with enough memory left do not change it" {
+    run recommend_limits $((256 * GIB)) $((7 * TIB / 2)) $((64 * GIB))
+    [ "$output" = "$REC_MIN $REC_MAX $((6 * GIB)) formula" ]
+}
+
+@test "recommendation: the host reserve is at least 2 GiB" {
+    run guest_headroom $((16 * GIB)) $((10 * GIB))
+    [ "$output" = $((4 * GIB)) ]
+}
+
+@test "recommendation: overcommitted hosts get the smallest valid max" {
+    run guest_headroom $((16 * GIB)) $((20 * GIB))
+    [ "$output" = $((64 * 1048576)) ]
+}
+
+@test "guests: memory of running VMs and containers is summed" {
+    fake_pvesh '[{"vmid":100,"status":"running","maxmem":2147483648},{"vmid":101,"status":"stopped","maxmem":8589934592}]' \
+        '[{"vmid":200,"status":"running","maxmem":1073741824}]'
+    [ "$(guest_memory_bytes)" = $((3 * GIB)) ]
+}
+
+@test "guests: unknown without pvesh" {
+    run guest_memory_bytes
+    [ "$status" -ne 0 ]
 }
 
 # Input
@@ -163,7 +205,6 @@ options zfs zfs_arc_min=${REC_MIN} zfs_arc_max=${REC_MAX}" ]
 }
 
 @test "custom limits with leading zeros" {
-    write_arcstats size=$((1 * GIB)) c_min=$((2 * GIB)) c_max=$((8 * GIB))
     run "$TUNER" --min 02 --max 08 --yes --no-persist --wait 0
     [ "$status" -eq 0 ]
     [ "$(cat "${ZFS_PARAMS_DIR}/zfs_arc_min")" = $((2 * GIB)) ]
@@ -246,4 +287,126 @@ zfs_arc_max=$((4 * GIB))" ]
     run "$TUNER" --bogus
     [ "$status" -eq 1 ]
     [[ "$output" == *"Unknown option"* ]]
+}
+
+# Guests
+
+@test "running guests are shown and limit the recommendation" {
+    set_storage
+    write_meminfo $((64 * GIB))
+    fake_pvesh '[{"status":"running","maxmem":'$((56 * GIB))'}]' '[]'
+    run "$TUNER" --recommended --dry-run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Running VMs/CTs Memory: 56.00 GiB (headroom for ARC: 4.80 GiB)"* ]]
+    [[ "$output" == *"Limited to the memory left after running VMs/CTs"* ]]
+    [[ "$output" == *"zfs_arc_min: 0.03 GiB"* ]]
+}
+
+@test "--ignore-guests skips the guest memory" {
+    set_storage
+    write_meminfo $((64 * GIB))
+    fake_pvesh '[{"status":"running","maxmem":'$((56 * GIB))'}]' '[]'
+    run "$TUNER" --recommended --dry-run --ignore-guests
+    [[ "$output" != *"Running VMs/CTs"* ]]
+    [[ "$output" == *"Capped to 10% of host RAM"* ]]
+}
+
+# Idempotency and exit codes
+
+@test "nothing is done when the limits are already applied and saved" {
+    set_applied
+    export FAKE_ROOT_FSTYPE=zfs
+    echo "options zfs zfs_arc_min=${REC_MIN} zfs_arc_max=${REC_MAX}" >"$CONFIG_FILE"
+    run "$TUNER" --recommended --yes --detailed-exitcode
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Already configured, nothing to change."* ]]
+    [ ! -e "$FAKE_INITRAMFS_LOG" ]
+    run bash -c "ls '${CONFIG_FILE}'.bak.* 2>/dev/null"
+    [ -z "$output" ]
+}
+
+@test "only the config is saved when the kernel already has the limits" {
+    set_applied
+    export FAKE_ROOT_FSTYPE=zfs
+    run "$TUNER" --recommended --yes --wait 0
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"[Step 1]"* ]]
+    [ "$(cat "$FAKE_INITRAMFS_LOG")" = "-u -k all" ]
+}
+
+@test "the initramfs is not updated when only the running kernel changes" {
+    set_storage
+    export FAKE_ROOT_FSTYPE=zfs
+    echo "options zfs zfs_arc_min=${REC_MIN} zfs_arc_max=${REC_MAX}" >"$CONFIG_FILE"
+    run "$TUNER" --recommended --yes --wait 0
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[Step 1]"* ]]
+    [ ! -e "$FAKE_INITRAMFS_LOG" ]
+}
+
+@test "--detailed-exitcode returns 2 when something changed" {
+    set_storage
+    run "$TUNER" --recommended --yes --wait 0 --detailed-exitcode
+    [ "$status" -eq 2 ]
+}
+
+@test "--detailed-exitcode returns 2 for a dry run with pending changes" {
+    set_storage
+    run "$TUNER" --recommended --dry-run --detailed-exitcode
+    [ "$status" -eq 2 ]
+}
+
+@test "changes are recorded in the system journal" {
+    set_storage
+    run "$TUNER" --recommended --yes --wait 0
+    [ "$status" -eq 0 ]
+    [[ "$(cat "$FAKE_LOGGER_LOG")" == *"-t pve-zfs-tuner -- Applied zfs_arc_min=${REC_MIN} zfs_arc_max=${REC_MAX}"* ]]
+    [[ "$(cat "$FAKE_LOGGER_LOG")" == *"Saved zfs_arc_min=${REC_MIN} zfs_arc_max=${REC_MAX} to ${CONFIG_FILE}"* ]]
+}
+
+# Reset and restore
+
+@test "reset explains that the running kernel keeps its limits until a reboot" {
+    echo $((4 * GIB)) >"${ZFS_PARAMS_DIR}/zfs_arc_max"
+    run "$TUNER" --reset --yes
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"the ZFS defaults apply after a reboot"* ]]
+}
+
+@test "restore brings back the most recent backup" {
+    set_storage
+    export FAKE_ROOT_FSTYPE=zfs
+    echo "options zfs zfs_arc_min=1 zfs_arc_max=2" >"${CONFIG_FILE}.bak.20260101-000000"
+    echo "options zfs zfs_arc_min=$((1 * GIB)) zfs_arc_max=$((2 * GIB)) zfs_txg_timeout=5" >"${CONFIG_FILE}.bak.20260201-000000"
+    echo "options zfs zfs_arc_min=${REC_MIN} zfs_arc_max=${REC_MAX}" >"$CONFIG_FILE"
+    run "$TUNER" --restore --yes --wait 0
+    [ "$status" -eq 0 ]
+    [ "$(cat "$CONFIG_FILE")" = "options zfs zfs_arc_min=$((1 * GIB)) zfs_arc_max=$((2 * GIB)) zfs_txg_timeout=5" ]
+    [ "$(cat "${ZFS_PARAMS_DIR}/zfs_arc_max")" = $((2 * GIB)) ]
+    [ "$(cat "$FAKE_INITRAMFS_LOG")" = "-u -k all" ]
+    # The replaced config is backed up as well, so the restore can be undone
+    run bash -c "ls '${CONFIG_FILE}'.bak.* | wc -l"
+    [ "$output" -eq 3 ]
+}
+
+@test "restore without a backup fails" {
+    run "$TUNER" --restore --yes
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"No backup"* ]]
+}
+
+@test "restore cannot be combined with --no-persist" {
+    run "$TUNER" --restore --no-persist
+    [ "$status" -eq 1 ]
+}
+
+@test "larger limits are suggested when the 10% cap applies but the guests leave more memory" {
+    set_storage
+    export FAKE_POOL_BYTES=$((8 * TIB))
+    write_meminfo $((64 * GIB))
+    # 48 GiB for guests and 3.2 GiB for the host leave 12.8 GiB
+    fake_pvesh '[{"status":"running","maxmem":'$((48 * GIB))'}]' '[]'
+    run "$TUNER" --recommended --dry-run
+    [[ "$output" == *"leave 12.80 GiB, so larger limits fit:"* ]]
+    [[ "$output" == *"--min 3072M --max 12G"* ]]
 }

@@ -40,36 +40,56 @@ write_psi() {
     [ "$(get_arc_stat missing)" = 0 ]
 }
 
-# Recommendations
+# Verdicts: classify <hit rate> <metadata hit rate> <metadata requests> <evicted>
+#                    <memory full stall> <I/O stall> <ghost hits of misses>
 
-@test "recommendation: memory stall is critical" {
-    run recommend 99.00 99.00 1000 0 6.00 0.00
-    [[ "$output" == *"[CRITICAL RAM DEFICIT]"* ]]
+@test "verdict: memory stall is critical" {
+    [ "$(classify 99.00 99.00 1000 0 6.00 0.00 0.00)" = critical_ram ]
 }
 
-@test "recommendation: low hit rate with I/O stall is a storage bottleneck" {
-    run recommend 70.00 99.00 1000 0 0.00 20.00
-    [[ "$output" == *"[WARNING: STORAGE BOTTLENECK]"* ]]
+@test "verdict: storage bottleneck with ghost hits suggests a larger ARC" {
+    [ "$(classify 70.00 99.00 1000 0 0.00 20.00 40.00)" = storage_bottleneck_expand ]
 }
 
-@test "recommendation: low hit rate without I/O stall is stable" {
-    run recommend 70.00 99.00 1000 0 0.00 1.00
-    [[ "$output" == *"[STABLE]"* ]]
+@test "verdict: storage bottleneck without ghost hits points to the storage" {
+    [ "$(classify 70.00 99.00 1000 0 0.00 20.00 5.00)" = storage_bottleneck ]
 }
 
-@test "recommendation: low metadata hit rate" {
-    run recommend 95.00 80.00 1000 0 0.00 1.00
-    [[ "$output" == *"Reduced METADATA cache efficiency"* ]]
+@test "verdict: low hit rate without I/O stall is stable" {
+    [ "$(classify 70.00 99.00 1000 0 0.00 1.00 0.00)" = stable ]
 }
 
-@test "recommendation: high churn" {
-    run recommend 95.00 99.00 1000 6000 0.00 1.00
-    [[ "$output" == *"High data churn rate"* ]]
+@test "verdict: low metadata hit rate" {
+    [ "$(classify 95.00 80.00 1000 0 0.00 1.00 0.00)" = metadata ]
 }
 
-@test "recommendation: excellent" {
-    run recommend 95.00 99.00 1000 0 0.00 1.00
-    [[ "$output" == *"[EXCELLENT]"* ]]
+@test "verdict: ghost hits mean the ARC is too small" {
+    [ "$(classify 95.00 99.00 1000 0 0.00 1.00 25.00)" = arc_too_small ]
+}
+
+@test "verdict: churn without ghost hits" {
+    [ "$(classify 95.00 99.00 1000 6000 0.00 1.00 0.00)" = churn ]
+}
+
+@test "verdict: excellent" {
+    [ "$(classify 95.00 99.00 1000 0 0.00 1.00 0.00)" = excellent ]
+}
+
+@test "suggested max grows by the ghost hit share, rounded up to a GiB" {
+    # 8 GiB + 25% = 10 GiB
+    [ "$(suggest_max $((8 * GIB)) 25.00 $((32 * GIB)))" = $((10 * GIB)) ]
+    # 8 GiB + 30% = 10.4 GiB, rounded up
+    [ "$(suggest_max $((8 * GIB)) 30.00 $((32 * GIB)))" = $((11 * GIB)) ]
+}
+
+@test "suggested max grows by at most half of the available memory" {
+    [ "$(suggest_max $((8 * GIB)) 100.00 $((4 * GIB)))" = $((10 * GIB)) ]
+}
+
+@test "descriptions include the suggested tuner command" {
+    run describe arc_too_small 95.00 99.00 0 0.00 1.00 25.00 "Max 8.0 GB -> 10.0 GB, e.g. pve-zfs-tuner.sh --min 1024M --max 10G"
+    [[ "$output" == *"25.00% of the misses were recently evicted data"* ]]
+    [[ "$output" == *"pve-zfs-tuner.sh --min 1024M --max 10G"* ]]
 }
 
 # End to end
@@ -125,19 +145,68 @@ write_psi() {
     [[ "$output" == *"must be run as root"* ]]
 }
 
-@test "hit rates are measured from the counter changes during the interval" {
-    write_arcstats size=$GIB c_min=$GIB c_max=$((8 * GIB)) hits=1000 misses=0 \
-        demand_data_hits=1000 demand_data_misses=0 deleted=0
-    # Counters grow in the middle of the 3 second interval
+# Writes arcstats twice: before and in the middle of a 3 second analyzer run
+run_with_counter_change() {
+    write_arcstats $1
     (
         sleep 1
-        write_arcstats size=$GIB c_min=$GIB c_max=$((8 * GIB)) hits=1900 misses=100 \
-            demand_data_hits=1900 demand_data_misses=100 deleted=10
+        write_arcstats $2
     ) &
-    run "$ANALYZER" --interval 3
+    run "$ANALYZER" --interval 3 "${@:3}"
     wait
+}
+
+@test "hit rates are measured from the counter changes during the interval" {
+    run_with_counter_change \
+        "size=$GIB c_min=$GIB c_max=$((8 * GIB)) hits=1000 misses=0 demand_data_hits=1000 demand_data_misses=0 deleted=0" \
+        "size=$GIB c_min=$GIB c_max=$((8 * GIB)) hits=1900 misses=100 demand_data_hits=1900 demand_data_misses=100 deleted=10"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Total Efficiency:         90.00% (Total Requests: 1000, Misses: 100)"* ]]
     [[ "$output" == *"Evicted Blocks (Cache):   10"* ]]
     [[ "$output" == *"[EXCELLENT]"* ]]
+}
+
+@test "ghost hits lead to a suggested max and a tuner command" {
+    echo "MemAvailable:   $((32 * GIB / 1024)) kB" >"$MEMINFO_FILE"
+    run_with_counter_change \
+        "size=$GIB c_min=$GIB c_max=$((8 * GIB)) hits=0 misses=0 demand_data_hits=0 demand_data_misses=0 mru_ghost_hits=0 mfu_ghost_hits=0" \
+        "size=$GIB c_min=$GIB c_max=$((8 * GIB)) hits=900 misses=100 demand_data_hits=900 demand_data_misses=100 mru_ghost_hits=20 mfu_ghost_hits=10"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Ghost Hits:               30.00% of misses"* ]]
+    [[ "$output" == *"ARC is too small"* ]]
+    [[ "$output" == *"Max 8.0 GB -> 11.0 GB, e.g. pve-zfs-tuner.sh --min 1024M --max 11G"* ]]
+}
+
+@test "JSON output" {
+    echo "MemAvailable:   $((32 * GIB / 1024)) kB" >"$MEMINFO_FILE"
+    write_psi memory 0 0
+    write_psi io 0 0
+    run_with_counter_change \
+        "size=$GIB c_min=$GIB c_max=$((8 * GIB)) metadata_size=1024 hits=0 misses=0 mru_ghost_hits=0 l2_size=$GIB l2_hits=0 l2_misses=0" \
+        "size=$GIB c_min=$GIB c_max=$((8 * GIB)) metadata_size=1024 hits=900 misses=100 mru_ghost_hits=30 l2_size=$GIB l2_hits=40 l2_misses=60" \
+        --json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r .verdict)" = arc_too_small ]
+    echo "$output" | jq -e ".hit_rate.total == 90"
+    echo "$output" | jq -e ".ghost_hit_percent == 30"
+    [ "$(echo "$output" | jq .suggested_max_bytes)" = $((11 * GIB)) ]
+    echo "$output" | jq -e ".l2arc.hit_rate == 40"
+    echo "$output" | jq -e ".psi.io_some == 0"
+    [ "$(echo "$output" | jq .arc.max_bytes)" = $((8 * GIB)) ]
+}
+
+@test "JSON output when idle" {
+    run "$ANALYZER" --interval 1 --json
+    [ "$status" -eq 0 ]
+    [ "$(echo "$output" | jq -r .verdict)" = idle ]
+    [ "$(echo "$output" | jq .psi)" = null ]
+    [ "$(echo "$output" | jq .suggested_max_bytes)" = null ]
+}
+
+@test "L2ARC is shown when present" {
+    run_with_counter_change \
+        "size=$GIB c_min=$GIB c_max=$((8 * GIB)) hits=0 misses=0 l2_size=$((100 * GIB)) l2_hits=0 l2_misses=0" \
+        "size=$GIB c_min=$GIB c_max=$((8 * GIB)) hits=900 misses=100 l2_size=$((100 * GIB)) l2_hits=75 l2_misses=25"
+    [[ "$output" == *"L2ARC Size:            100.0 GB"* ]]
+    [[ "$output" == *"L2ARC Efficiency:         75.00% (Requests: 100)"* ]]
 }

@@ -4,6 +4,31 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-26
+
+### Added
+
+- Tuner: the memory of running VMs and containers (from `pvesh`) limits the recommended Max on Proxmox VE, with a low Min so the ARC can shrink; `--ignore-guests` to skip it
+- Tuner: when the 10% RAM cap applies but the guests leave more memory, limits that fit in it are suggested
+- Tuner: idempotent runs — only what differs is changed, and the initramfs is rebuilt only when the config changed
+- Tuner: `--detailed-exitcode` (0 unchanged, 2 changed, 1 error) for configuration management
+- Tuner: `--restore` of the config from the most recent backup, also in the interactive menu
+- Tuner: changes are recorded in the system journal (`journalctl -t pve-zfs-tuner`)
+- Analyzer: ghost hits (misses for recently evicted data) decide whether a larger ARC would help, with a suggested new Max and the tuner command to apply it
+- Analyzer: L2ARC size and hit rate
+- Analyzer: `--json` output for monitoring
+- Integration tests against the real ZFS kernel module in CI
+- shfmt formatting check in CI, settings in `.editorconfig`
+
+### Changed
+
+- Analyzer: a storage bottleneck with few ghost hits recommends faster storage instead of a larger ARC, and high churn without ghost hits no longer recommends a larger ARC
+
+### Fixed
+
+- Tuner: `--reset` claimed the defaults were active in the running kernel; ZFS keeps the current limits until a reboot, and the tuner now says so
+- Tuner: the active kernel limits are shown from the ZFS statistics instead of the module parameters
+
 ## [1.0.0] - 2026-09-26
 
 ### Added
