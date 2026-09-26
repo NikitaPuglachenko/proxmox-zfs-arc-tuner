@@ -248,8 +248,12 @@ main() {
     done
 
     if [ -n "$custom_min" ] || [ -n "$custom_max" ]; then
-        [ -z "$mode" ] || die "--min/--max cannot be combined with --${mode}"
-        [ -n "$custom_min" ] && [ -n "$custom_max" ] || die "--min and --max must be used together"
+        if [ -n "$mode" ]; then
+            die "--min/--max cannot be combined with --${mode}"
+        fi
+        if [ -z "$custom_min" ] || [ -z "$custom_max" ]; then
+            die "--min and --max must be used together"
+        fi
         mode="custom"
     fi
 
@@ -257,7 +261,9 @@ main() {
     if [ "$dry_run" -eq 0 ] && [ "$(id -u)" -ne 0 ] && [ -z "${ZFS_TUNER_SKIP_ROOT_CHECK:-}" ]; then
         die "This script must be run as root (via sudo). Use --dry-run to only see the recommendation."
     fi
-    [ -d "$ZFS_PARAMS_DIR" ] && [ -r "$ARCSTATS_FILE" ] || die "ZFS module is not loaded."
+    if [ ! -d "$ZFS_PARAMS_DIR" ] || [ ! -r "$ARCSTATS_FILE" ]; then
+        die "ZFS module is not loaded."
+    fi
 
     # 1. Current state
     local ram pool arc runtime_min runtime_max config_min="Not set" config_max="Not set"

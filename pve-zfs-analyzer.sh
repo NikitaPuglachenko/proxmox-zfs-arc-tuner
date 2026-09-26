@@ -115,10 +115,10 @@ main() {
         case "$1" in
             -i | --interval)
                 INTERVAL="${2:-}"
-                [[ "$INTERVAL" =~ ^[0-9]+$ ]] && [ "$INTERVAL" -gt 0 ] || {
+                if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -eq 0 ]; then
                     echo -e "${RED}Error: --interval expects a positive number of seconds.${NC}" >&2
                     exit 1
-                }
+                fi
                 shift
                 ;;
             -h | --help)
@@ -149,7 +149,9 @@ main() {
     fi
 
     local psi_available=1
-    [ -r "${PSI_DIR}/memory" ] && [ -r "${PSI_DIR}/io" ] || psi_available=0
+    if [ ! -r "${PSI_DIR}/memory" ] || [ ! -r "${PSI_DIR}/io" ]; then
+        psi_available=0
+    fi
 
     echo -e "${BLUE}=== Gathering Initial ARC Metrics... ===${NC}"
     local h1 m1 dh1 dm1 mh1 mm1 pf_dh1 pf_dm1 pf_mh1 pf_mm1 del1
