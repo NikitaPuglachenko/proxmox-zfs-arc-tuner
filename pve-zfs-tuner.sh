@@ -1,187 +1,459 @@
 #!/usr/bin/env bash
-# Proxmox VE ZFS ARC Tuner (Fixed & Enhanced with Min/Max Logic)
-set -e
+# Proxmox VE ZFS ARC Tuner: calculates, applies and persists ZFS ARC limits.
 
-# 0. Check for root privileges
-if [ "$EUID" -ne 0 ]; then
-    echo -e "\033[0;31m[ERROR] This script must be run as root (via sudo).\033[0m"
-    exit 1
+VERSION="1.0.0"
+
+# System paths, overridable for testing
+ZFS_PARAMS_DIR="${ZFS_PARAMS_DIR:-/sys/module/zfs/parameters}"
+ARCSTATS_FILE="${ARCSTATS_FILE:-/proc/spl/kstat/zfs/arcstats}"
+MEMINFO_FILE="${MEMINFO_FILE:-/proc/meminfo}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/modprobe.d/zfs.conf}"
+
+MIB=1048576
+GIB=1073741824
+TIB=1099511627776
+
+# ZFS ignores zfs_arc_max below 64 MiB and zfs_arc_min below 32 MiB
+MIN_ARC_MAX_BYTES=$((64 * MIB))
+MIN_ARC_MIN_BYTES=$((32 * MIB))
+
+# Baseline sizing formula recommended by Proxmox: 2 GiB + 1 GiB per TiB of raw storage
+BASE_BYTES=$((2 * GIB))
+PER_TIB_BYTES=$((1 * GIB))
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+else
+    RED='' GREEN='' YELLOW='' BLUE='' NC=''
 fi
 
-# 1. Check if ZFS module is loaded
-if ! lsmod | grep -q zfs; then
-    echo -e "\033[0;31m[ERROR] ZFS module is not loaded.\033[0m"
+info() { echo -e "$*"; }
+warn() { echo -e "${YELLOW}[WARNING] $*${NC}"; }
+error() { echo -e "${RED}[ERROR] $*${NC}" >&2; }
+die() {
+    error "$*"
     exit 1
-fi
-
-# Helper function to convert bytes to GB/TB via awk
-format_bytes() {
-    awk -v b="$1" -v s="$2" 'BEGIN {printf "%.2f", b / (1024^s)}'
 }
 
-# Helper function to fetch current ARC size safely
-get_current_arc_bytes() {
-    if [ -f /proc/spl/kstat/zfs/arcstats ]; then
-        awk '/^size/ {print $3}' /proc/spl/kstat/zfs/arcstats 2>/dev/null || echo 0
-    else
+usage() {
+    cat <<EOF
+Proxmox VE ZFS ARC Tuner ${VERSION}
+
+Calculates a recommended ZFS ARC size, applies it to the running kernel and
+optionally saves it to ${CONFIG_FILE}.
+
+Usage: $(basename "$0") [options]
+
+Without options, the tuner runs interactively.
+
+Target (pick one):
+  --recommended         Apply the smart recommendation
+  --min SIZE --max SIZE Apply custom limits (e.g. 4G, 512M; a plain number means GiB)
+  --reset               Remove the limits and return to the ZFS defaults
+
+Options:
+  --persist             Save the limits to ${CONFIG_FILE} without asking
+  --no-persist          Apply the limits to the running kernel only
+  -y, --yes             Answer yes to all questions (non-interactive)
+  --dry-run             Show what would be done without changing anything
+  --wait SECONDS        Seconds to monitor cache eviction after applying (default: 10)
+  -h, --help            Show this help
+  --version             Show the version
+EOF
+}
+
+# Formats bytes as GiB with two decimals
+format_gib() {
+    awk -v b="$1" 'BEGIN { printf "%.2f", b / 1073741824 }'
+}
+
+# Parses a size such as "4", "4G" or "512M" into bytes; a plain number means GiB
+parse_size() {
+    local value="$1" number unit
+    [[ "$value" =~ ^([0-9]+)([MmGg]?)$ ]] || return 1
+    number=$((10#${BASH_REMATCH[1]}))
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        M | m) echo $((number * MIB)) ;;
+        *) echo $((number * GIB)) ;;
+    esac
+}
+
+# Prints a value from arcstats, or 0 if it is missing
+read_arcstat() {
+    awk -v name="$1" '$1 == name { print $3; found = 1 } END { if (!found) print 0 }' "$ARCSTATS_FILE" 2>/dev/null || echo 0
+}
+
+# Prints a ZFS module parameter, or 0 if it is missing
+read_param() {
+    cat "${ZFS_PARAMS_DIR}/$1" 2>/dev/null || echo 0
+}
+
+total_ram_bytes() {
+    awk '/^MemTotal:/ { printf "%.0f", $2 * 1024 }' "$MEMINFO_FILE"
+}
+
+total_pool_bytes() {
+    command -v zpool >/dev/null 2>&1 || {
         echo 0
+        return
+    }
+    zpool list -p -H -o size 2>/dev/null | awk '{ sum += $1 } END { printf "%.0f", sum }'
+}
+
+root_is_zfs() {
+    [ "$(findmnt -n -o FSTYPE / 2>/dev/null)" = "zfs" ]
+}
+
+# Prints "<min> <max> <baseline> <capped>" for the given RAM and raw pool size in bytes:
+# - baseline: 2 GiB + 1 GiB per TiB of raw storage, rounded up to the next TiB
+# - min: 50% of the baseline, max: 2x the baseline
+# - if max exceeds 10% of RAM, max is capped to 10% of RAM and min set to 25% of it
+recommend_limits() {
+    local ram="$1" pool="$2" tib baseline min max cap capped=0
+    tib=$(((pool + TIB - 1) / TIB))
+    baseline=$((BASE_BYTES + PER_TIB_BYTES * tib))
+    min=$((baseline / 2))
+    max=$((baseline * 2))
+    cap=$((ram / 10))
+    if [ "$max" -gt "$cap" ]; then
+        max=$cap
+        min=$((max / 4))
+        capped=1
+    fi
+    echo "$min $max $baseline $capped"
+}
+
+# Checks the limits against what ZFS accepts; prints the reason and fails if invalid
+validate_limits() {
+    local min="$1" max="$2" ram="$3"
+    if [ "$min" -lt "$MIN_ARC_MIN_BYTES" ]; then
+        echo "MIN must be at least 32 MiB, otherwise ZFS ignores it"
+        return 1
+    fi
+    if [ "$max" -lt "$MIN_ARC_MAX_BYTES" ]; then
+        echo "MAX must be at least 64 MiB, otherwise ZFS ignores it"
+        return 1
+    fi
+    if [ "$min" -ge "$max" ]; then
+        echo "MAX must be greater than MIN, otherwise ZFS ignores it"
+        return 1
+    fi
+    if [ "$max" -ge "$ram" ]; then
+        echo "MAX must be less than the total host RAM ($(format_gib "$ram") GiB)"
+        return 1
     fi
 }
 
-# 2. Gather system memory metrics
-TOTAL_RAM_BYTES=$(free -b | awk '/^Mem:/{print $2}')
-TOTAL_RAM_GB=$(format_bytes "$TOTAL_RAM_BYTES" 3)
-CURRENT_ARC_BYTES=$(get_current_arc_bytes)
-CURRENT_ARC_GB=$(format_bytes "$CURRENT_ARC_BYTES" 3)
+# Writes the config with zfs_arc_min/zfs_arc_max replaced, keeping all other ZFS options.
+# Without min and max, only removes them (reset to the ZFS defaults).
+update_modprobe_conf() {
+    local file="$1" min="${2:-}" max="${3:-}" tmp
+    tmp=$(mktemp)
+    touch "$file"
+    awk -v min="$min" -v max="$max" '
+        $1 == "options" && $2 == "zfs" {
+            line = "options zfs"
+            for (i = 3; i <= NF; i++) {
+                if ($i !~ /^zfs_arc_(min|max)=/) line = line " " $i
+            }
+            if (line != "options zfs") print line
+            next
+        }
+        { print }
+        END {
+            if (max != "") print "options zfs zfs_arc_min=" min " zfs_arc_max=" max
+        }
+    ' "$file" >"$tmp"
+    cat "$tmp" >"$file"
+    rm -f "$tmp"
+}
 
-# Fetch active kernel limits (Runtime Limits)
-RUNTIME_MAX_BYTES=$(cat /sys/module/zfs/parameters/zfs_arc_max 2>/dev/null || echo 0)
-RUNTIME_MAX=$([ "$RUNTIME_MAX_BYTES" -eq 0 ] && echo "Unlimited" || echo "$(format_bytes "$RUNTIME_MAX_BYTES" 3) GB")
-RUNTIME_MIN_BYTES=$(cat /sys/module/zfs/parameters/zfs_arc_min 2>/dev/null || echo 0)
-RUNTIME_MIN="$(format_bytes "$RUNTIME_MIN_BYTES" 3) GB"
+backup_config() {
+    local backup
+    [ -s "$CONFIG_FILE" ] || return 0
+    backup="${CONFIG_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+    cp -p "$CONFIG_FILE" "$backup"
+    info "  Backup saved to ${backup}"
+}
 
-# Fetch persistent limits from config file (Fixed parsing logic)
-CONFIG_FILE="/etc/modprobe.d/zfs.conf"
-CURRENT_CONFIG_MAX="Not set"
-CURRENT_CONFIG_MIN="Not set"
-if [ -f "$CONFIG_FILE" ]; then
-    L_MAX_BYTES=$(grep -E "options zfs" "$CONFIG_FILE" | grep -oE "zfs_arc_max=[0-9]+" | cut -d= -f2 || true)
-    L_MIN_BYTES=$(grep -E "options zfs" "$CONFIG_FILE" | grep -oE "zfs_arc_min=[0-9]+" | cut -d= -f2 || true)
-    [ -n "$L_MAX_BYTES" ] && CURRENT_CONFIG_MAX="$(format_bytes "$L_MAX_BYTES" 3) GB"
-    [ -n "$L_MIN_BYTES" ] && CURRENT_CONFIG_MIN="$(format_bytes "$L_MIN_BYTES" 3) GB"
-fi
+write_param() {
+    echo "$2" >"${ZFS_PARAMS_DIR}/$1"
+}
 
-# 3. Calculate total raw storage space from all ZFS pools
-TOTAL_POOL_BYTES=$(zpool list -p -H -o size 2>/dev/null | awk '{sum+=$1} END {print sum+0}')
-TOTAL_POOL_TIB=$(format_bytes "$TOTAL_POOL_BYTES" 4)
+# Writes the limits in an order the kernel accepts: when raising MIN above the
+# current MAX, MAX has to be raised first, otherwise MIN is lowered first.
+apply_runtime() {
+    local min="$1" max="$2" current_max
+    current_max=$(read_arcstat c_max)
+    if [ "$min" -gt "$current_max" ]; then
+        write_param zfs_arc_max "$max" || return 1
+        write_param zfs_arc_min "$min" || return 1
+    else
+        write_param zfs_arc_min "$min" || return 1
+        write_param zfs_arc_max "$max" || return 1
+    fi
+}
 
-# 4. Perform Recommendation Sizing Logic
-RAM_10_BYTES=$(( TOTAL_RAM_BYTES / 10 ))
-RAM_10_GB=$(format_bytes "$RAM_10_BYTES" 3)
+# Asks a yes/no question; --yes answers yes, no input (EOF) answers no
+confirm() {
+    local answer
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    read -r -p "$1 (y/n): " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
 
-# Bash math trick for Ceiling division (rounded up TB)
-ONE_TIB_BYTES=1099511627776
-RAW_STORAGE_TIB_ROUNDED=$(( (TOTAL_POOL_BYTES + ONE_TIB_BYTES - 1) / ONE_TIB_BYTES ))
-[ "$TOTAL_POOL_BYTES" -eq 0 ] && RAW_STORAGE_TIB_ROUNDED=0
+main() {
+    set -euo pipefail
 
-# Baseline sizing formula: 2GB baseline + 1GB per 1TB of raw storage
-BASE_MB=2048
-PER_TB_MB=1024
-FULL_RECOMMENDATION_MB=$(( BASE_MB + (PER_TB_MB * RAW_STORAGE_TIB_ROUNDED) ))
+    local mode="" persist="ask" dry_run=0 wait_seconds=10 custom_min="" custom_max=""
+    ASSUME_YES=0
 
-# Define proportions:
-# - Min: 50% (0.5x) of the baseline recommendation
-# - Max: 200% (2.0x) of the baseline recommendation, making Max exactly 4x of Min
-REC_MIN_MB=$(( FULL_RECOMMENDATION_MB / 2 ))
-FORMULA_MIN_BYTES=$(( REC_MIN_MB * 1024 * 1024 ))
-FORMULA_MAX_BYTES=$(( FORMULA_MIN_BYTES * 4 ))
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --recommended) mode="recommended" ;;
+            --reset) mode="reset" ;;
+            --min)
+                custom_min="${2:-}"
+                shift
+                ;;
+            --max)
+                custom_max="${2:-}"
+                shift
+                ;;
+            --persist) persist="yes" ;;
+            --no-persist) persist="no" ;;
+            -y | --yes) ASSUME_YES=1 ;;
+            --dry-run) dry_run=1 ;;
+            --wait)
+                wait_seconds="${2:-}"
+                [[ "$wait_seconds" =~ ^[0-9]+$ ]] || die "--wait expects a number of seconds"
+                shift
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            --version)
+                echo "$VERSION"
+                exit 0
+                ;;
+            *) die "Unknown option: $1 (see --help)" ;;
+        esac
+        shift
+    done
 
-# SAFETY CAP: If Formula Max exceeds 10% of host RAM, throttle down to 10% RAM max capacity
-if [ "$FORMULA_MAX_BYTES" -gt "$RAM_10_BYTES" ]; then
-    REC_MAX_BYTES=$RAM_10_BYTES
-    # Maintain strict 1:4 layout ratio (Min always equals Max / 4)
-    REC_MIN_BYTES=$(( REC_MAX_BYTES / 4 ))
-    REC_REASON="Capped to 10% of host RAM (Formula exceeded safe threshold)"
-else
-    REC_MIN_BYTES=$FORMULA_MIN_BYTES
-    REC_MAX_BYTES=$FORMULA_MAX_BYTES
-    REC_REASON="Min = 50% of formula (2GB+1GB/TB), Max = 2x formula (4x of Min)"
-fi
+    if [ -n "$custom_min" ] || [ -n "$custom_max" ]; then
+        if [ -n "$mode" ]; then
+            die "--min/--max cannot be combined with --${mode}"
+        fi
+        if [ -z "$custom_min" ] || [ -z "$custom_max" ]; then
+            die "--min and --max must be used together"
+        fi
+        mode="custom"
+    fi
 
-REC_MIN_GB=$(format_bytes "$REC_MIN_BYTES" 3)
-REC_MAX_GB=$(format_bytes "$REC_MAX_BYTES" 3)
+    # 0. Preconditions (ZFS_TUNER_SKIP_ROOT_CHECK is used by the tests)
+    if [ "$dry_run" -eq 0 ] && [ "$(id -u)" -ne 0 ] && [ -z "${ZFS_TUNER_SKIP_ROOT_CHECK:-}" ]; then
+        die "This script must be run as root (via sudo). Use --dry-run to only see the recommendation."
+    fi
+    if [ ! -d "$ZFS_PARAMS_DIR" ] || [ ! -r "$ARCSTATS_FILE" ]; then
+        die "ZFS module is not loaded."
+    fi
 
-# 5. Display current environment state
-echo -e "\033[0;33mCurrent System State:\033[0m"
-echo -e "  Host Total RAM:         \033[0;32m${TOTAL_RAM_GB} GB\033[0m"
-echo -e "  Total Raw ZFS Storage:  \033[0;32m${TOTAL_POOL_TIB} TiB\033[0m (Rounded: ${RAW_STORAGE_TIB_ROUNDED} TB)"
-echo -e "  Current ARC Footprint:  \033[0;32m${CURRENT_ARC_GB} GB\033[0m (actual RAM used)"
-echo -e "  Active Kernel Limits:   \033[0;32mMin: ${RUNTIME_MIN} / Max: ${RUNTIME_MAX}\033[0m"
-echo -e "  Persistent Config:      \033[0;32mMin: ${CURRENT_CONFIG_MIN} / Max: ${CURRENT_CONFIG_MAX}\033[0m\n"
+    # 1. Current state
+    local ram pool arc runtime_min runtime_max config_min="Not set" config_max="Not set"
+    ram=$(total_ram_bytes)
+    pool=$(total_pool_bytes)
+    arc=$(read_arcstat size)
+    runtime_min=$(read_param zfs_arc_min)
+    runtime_max=$(read_param zfs_arc_max)
+    if [ -f "$CONFIG_FILE" ]; then
+        local value
+        value=$(grep -E '^[[:space:]]*options[[:space:]]+zfs[[:space:]]' "$CONFIG_FILE" | grep -oE 'zfs_arc_min=[0-9]+' | tail -n 1 | cut -d= -f2 || true)
+        [ -n "$value" ] && config_min="$(format_gib "$value") GiB"
+        value=$(grep -E '^[[:space:]]*options[[:space:]]+zfs[[:space:]]' "$CONFIG_FILE" | grep -oE 'zfs_arc_max=[0-9]+' | tail -n 1 | cut -d= -f2 || true)
+        [ -n "$value" ] && config_max="$(format_gib "$value") GiB"
+    fi
 
-echo -e "\033[0;33mCalculated Target Options:\033[0m"
-echo -e "  - 10% of Host RAM (Max Limit): \033[0;34m${RAM_10_GB} GB\033[0m"
-echo -e "  - Raw Formula (Max Limit):     \033[0;34m$(format_bytes "$FORMULA_MAX_BYTES" 3) GB\033[0m"
-echo -e "  * Smart Recommendation:        \033[0;32mMin: ${REC_MIN_GB} GB / Max: ${REC_MAX_GB} GB\033[0m"
-echo -e "                                 [Reason: ${REC_REASON}]\n"
+    local runtime_min_text runtime_max_text
+    runtime_min_text=$([ "$runtime_min" -eq 0 ] && echo "ZFS default ($(format_gib "$(read_arcstat c_min)") GiB)" || echo "$(format_gib "$runtime_min") GiB")
+    runtime_max_text=$([ "$runtime_max" -eq 0 ] && echo "ZFS default ($(format_gib "$(read_arcstat c_max)") GiB)" || echo "$(format_gib "$runtime_max") GiB")
 
-echo -e "\033[0;33mChoose your configuration target:\033[0m"
-echo -e "  1) Apply Smart Recommendation (Min: ${REC_MIN_GB}G / Max: ${REC_MAX_GB}G) + 10s Verification"
-echo -e "  2) Define custom limits manually"
-echo -e "  *) Cancel and exit\n"
+    # 2. Recommendation
+    local rec_min rec_max baseline capped reason
+    read -r rec_min rec_max baseline capped <<<"$(recommend_limits "$ram" "$pool")"
+    if [ "$capped" -eq 1 ]; then
+        reason="Capped to 10% of host RAM (formula exceeded the safe threshold)"
+    else
+        reason="Min = 50% of formula (2 GiB + 1 GiB/TiB), Max = 2x formula"
+    fi
 
-read -p "Select option (1/2/*): " CONFIG_CHOICE
+    info "${YELLOW}Current System State:${NC}"
+    info "  Host Total RAM:         ${GREEN}$(format_gib "$ram") GiB${NC}"
+    info "  Total Raw ZFS Storage:  ${GREEN}$(awk -v b="$pool" 'BEGIN { printf "%.2f", b / 1099511627776 }') TiB${NC}"
+    info "  Current ARC Footprint:  ${GREEN}$(format_gib "$arc") GiB${NC} (actual RAM used)"
+    info "  Active Kernel Limits:   ${GREEN}Min: ${runtime_min_text} / Max: ${runtime_max_text}${NC}"
+    info "  Persistent Config:      ${GREEN}Min: ${config_min} / Max: ${config_max}${NC}\n"
 
-case $CONFIG_CHOICE in
-    1)
-        TARGET_MIN_BYTES=$REC_MIN_BYTES
-        TARGET_MAX_BYTES=$REC_MAX_BYTES
-        ;;
-    2)
-        read -p "Enter your custom MIN limit in Gigabytes: " USER_MIN_GB
-        [[ "$USER_MIN_GB" =~ ^[0-9]+$ ]] || { echo -e "\033[0;31m[ERROR] Invalid input.\033[0m"; exit 1; }
-        TARGET_MIN_BYTES=$(( USER_MIN_GB * 1024 * 1024 * 1024 ))
+    info "${YELLOW}Calculated Target Options:${NC}"
+    info "  - 10% of Host RAM (Max Limit): ${BLUE}$(format_gib $((ram / 10))) GiB${NC}"
+    info "  - Raw Formula (Max Limit):     ${BLUE}$(format_gib $((baseline * 2))) GiB${NC}"
+    info "  * Smart Recommendation:        ${GREEN}Min: $(format_gib "$rec_min") GiB / Max: $(format_gib "$rec_max") GiB${NC}"
+    info "                                 [Reason: ${reason}]"
+    if [ "$rec_max" -lt "$baseline" ]; then
+        warn "The recommended Max is below the Proxmox guideline of $(format_gib "$baseline") GiB (2 GiB + 1 GiB per TiB of storage)."
+        info "  Consider more RAM, or custom limits if the host can spare the memory."
+    fi
+    info ""
 
-        read -p "Enter your custom MAX limit in Gigabytes (must be >= MIN): " USER_MAX_GB
-        [[ "$USER_MAX_GB" =~ ^[0-9]+$ ]] || { echo -e "\033[0;31m[ERROR] Invalid input.\033[0m"; exit 1; }
-        TARGET_MAX_BYTES=$(( USER_MAX_GB * 1024 * 1024 * 1024 ))
+    # 3. Target
+    if [ -z "$mode" ]; then
+        local choice=""
+        info "${YELLOW}Choose your configuration target:${NC}"
+        info "  1) Apply Smart Recommendation (Min: $(format_gib "$rec_min") GiB / Max: $(format_gib "$rec_max") GiB)"
+        info "  2) Define custom limits manually"
+        info "  3) Reset to the ZFS defaults"
+        info "  *) Cancel and exit\n"
+        read -r -p "Select option (1/2/3/*): " choice || true
+        case "$choice" in
+            1) mode="recommended" ;;
+            2)
+                mode="custom"
+                read -r -p "Enter your custom MIN limit (e.g. 4G, 512M; a plain number means GiB): " custom_min || true
+                read -r -p "Enter your custom MAX limit (e.g. 16G; a plain number means GiB): " custom_max || true
+                ;;
+            3) mode="reset" ;;
+            *)
+                info "${YELLOW}Operation cancelled.${NC}"
+                exit 0
+                ;;
+        esac
+        # The menu choice is the confirmation
+        ASSUME_YES_APPLY=1
+    fi
 
-        if [ "$TARGET_MIN_BYTES" -gt "$TARGET_MAX_BYTES" ]; then
-            echo -e "\033[0;31m[ERROR] MIN limit cannot be greater than MAX limit.\033[0m"
+    local target_min="" target_max=""
+    case "$mode" in
+        recommended)
+            target_min=$rec_min
+            target_max=$rec_max
+            ;;
+        custom)
+            target_min=$(parse_size "$custom_min") || die "Invalid MIN limit: '${custom_min}'"
+            target_max=$(parse_size "$custom_max") || die "Invalid MAX limit: '${custom_max}'"
+            ;;
+    esac
+
+    if [ "$mode" = "reset" ]; then
+        info "${YELLOW}Target:${NC} remove zfs_arc_min/zfs_arc_max and return to the ZFS defaults"
+    else
+        local problem
+        problem=$(validate_limits "$target_min" "$target_max" "$ram") || die "$problem"
+        if [ "$target_max" -gt $((ram / 2)) ]; then
+            warn "MAX is more than 50% of the host RAM, which leaves less memory for VMs and containers."
+        fi
+        info "${YELLOW}Target Limits:${NC}"
+        info "  zfs_arc_min: $(format_gib "$target_min") GiB (${target_min} bytes)"
+        info "  zfs_arc_max: $(format_gib "$target_max") GiB (${target_max} bytes)"
+    fi
+
+    if [ "$dry_run" -eq 1 ]; then
+        info "\n${BLUE}[DRY RUN] Nothing was changed. The tuner would:${NC}"
+        if [ "$mode" = "reset" ]; then
+            info "  - write 0 to ${ZFS_PARAMS_DIR}/zfs_arc_min and zfs_arc_max"
+        else
+            info "  - write ${target_min} to ${ZFS_PARAMS_DIR}/zfs_arc_min and ${target_max} to zfs_arc_max"
+        fi
+        if [ "$persist" != "no" ]; then
+            info "  - save ${CONFIG_FILE} (after a backup) with the ZFS options:"
+            local preview
+            preview=$(mktemp)
+            [ -f "$CONFIG_FILE" ] && cp "$CONFIG_FILE" "$preview"
+            update_modprobe_conf "$preview" "$target_min" "$target_max"
+            grep -E '^options zfs' "$preview" | sed 's/^/      /' || info "      (no ZFS options)"
+            rm -f "$preview"
+            if root_is_zfs; then
+                info "  - run update-initramfs -u -k all (root filesystem is on ZFS)"
+            fi
+        fi
+        exit 0
+    fi
+
+    if [ "${ASSUME_YES_APPLY:-0}" -ne 1 ] && ! confirm "Apply these limits to the running kernel?"; then
+        info "${YELLOW}Operation cancelled.${NC}"
+        exit 0
+    fi
+
+    # 4. Apply to the running kernel
+    if [ "$mode" = "reset" ]; then
+        { write_param zfs_arc_min 0 && write_param zfs_arc_max 0; } ||
+            die "Failed to reset the ZFS ARC parameters."
+        info "${GREEN}[Step 1] ZFS ARC limits reset to the defaults in the running kernel.${NC}"
+    else
+        apply_runtime "$target_min" "$target_max" || die "Failed to update the ZFS ARC parameters."
+        info "${GREEN}[Step 1] Target limits applied to the running kernel.${NC}"
+
+        # ZFS accepts any value written to the parameters, but silently ignores invalid ones
+        local c_min c_max
+        c_min=$(read_arcstat c_min)
+        c_max=$(read_arcstat c_max)
+        if [ "$c_min" -ne "$target_min" ] || [ "$c_max" -ne "$target_max" ]; then
+            warn "ZFS did not accept the limits: active Min $(format_gib "$c_min") GiB / Max $(format_gib "$c_max") GiB."
+            info "  Check 'dmesg' for ZFS messages."
+        fi
+
+        if [ "$wait_seconds" -gt 0 ]; then
+            echo -ne "${YELLOW}[Step 2] Waiting ${wait_seconds} seconds to monitor cache eviction... ${NC}"
+            local i
+            for ((i = wait_seconds; i > 0; i--)); do
+                echo -n "$i.."
+                sleep 1
+            done
+            info " Done."
+            arc=$(read_arcstat size)
+            if [ "$arc" -gt "$target_max" ]; then
+                warn "ZFS cache footprint remains higher than Max: $(format_gib "$arc") GiB"
+                info "  ZFS evicts data gradually as the system demands memory or activity decreases."
+            else
+                info "${GREEN}[SUCCESS] ZFS cache is within the target limits.${NC}"
+            fi
+        fi
+    fi
+
+    # 5. Persist
+    if [ "$persist" = "ask" ]; then
+        if confirm "Save this configuration permanently to ${CONFIG_FILE}?"; then
+            persist="yes"
+        else
+            persist="no"
+        fi
+    fi
+    if [ "$persist" = "no" ]; then
+        info "${YELLOW}The limits are active until the next reboot and were not saved.${NC}"
+        exit 0
+    fi
+
+    backup_config
+    update_modprobe_conf "$CONFIG_FILE" "$target_min" "$target_max"
+    info "${GREEN}[SUCCESS] Configuration saved to ${CONFIG_FILE}${NC}"
+
+    # With the root filesystem on ZFS, the module options are read from the initramfs
+    if root_is_zfs; then
+        info "${YELLOW}Root filesystem is on ZFS, updating the initramfs...${NC}"
+        if command -v update-initramfs >/dev/null 2>&1 && update-initramfs -u -k all; then
+            info "${GREEN}[SUCCESS] initramfs updated, the limits apply after reboot.${NC}"
+        else
+            error "Failed to update the initramfs. Run 'update-initramfs -u -k all' manually, otherwise the limits are not applied after reboot."
             exit 1
         fi
-        ;;
-    *) echo -e "\033[0;33mOperation cancelled.\033[0m"; exit 0 ;;
-esac
+    fi
+}
 
-# 6. Apply runtime modifications (CRITICAL ORDER: MIN FIRST, THEN MAX)
-CURRENT_LIVE_MAX=$(cat /sys/module/zfs/parameters/zfs_arc_max 2>/dev/null || echo 0)
-
-if [ "$TARGET_MIN_BYTES" -gt "$CURRENT_LIVE_MAX" ] && [ "$CURRENT_LIVE_MAX" -ne 0 ]; then
-    echo "$TARGET_MAX_BYTES" > /sys/module/zfs/parameters/zfs_arc_max
-fi
-
-if echo "$TARGET_MIN_BYTES" > /sys/module/zfs/parameters/zfs_arc_min; then
-    echo -e "\033[0;32m[Step 1a] Target MIN limit temporarily applied to kernel.\033[0m"
-else
-    echo -e "\033[0;31m[ERROR] Failed to update zfs_arc_min parameter.\033[0m"; exit 1
-fi
-
-if echo "$TARGET_MAX_BYTES" > /sys/module/zfs/parameters/zfs_arc_max; then
-    echo -e "\033[0;32m[Step 1b] Target MAX limit temporarily applied to kernel.\033[0m"
-else
-    echo -e "\033[0;31m[ERROR] Failed to update zfs_arc_max parameter.\033[0m"; exit 1
-fi
-
-# Verification loop
-echo -ne "\033[0;33m[Step 2] Waiting 10 seconds to monitor cache eviction... \033[0m"
-for i in {10..1}; do echo -ne "$i.."; sleep 1; done
-echo -e " Done."
-
-POST_ARC_BYTES=$(get_current_arc_bytes)
-if [ "$POST_ARC_BYTES" -gt "$TARGET_MAX_BYTES" ]; then
-    echo -e "\n\033[0;31m[ATTENTION] ZFS cache footprint remains higher than Max: $(format_bytes "$POST_ARC_BYTES" 3) GB\033[0m"
-    echo -e "ZFS will evict data gradually as the system demands memory or active operations decrease."
-else
-    echo -e "\033[0;32m[SUCCESS] ZFS successfully stabilizing cache within target limits.\033[0m"
-fi
-
-FINAL_MIN_GB=$(format_bytes "$TARGET_MIN_BYTES" 3)
-FINAL_MAX_GB=$(format_bytes "$TARGET_MAX_BYTES" 3)
-echo -e "\n\033[0;33mFinal Selected Target Limits:\033[0m"
-echo -e "  zfs_arc_min: ${FINAL_MIN_GB} GB (${TARGET_MIN_BYTES} bytes)"
-echo -e "  zfs_arc_max: ${FINAL_MAX_GB} GB (${TARGET_MAX_BYTES} bytes)"
-
-# 7. Make modifications permanent (Fixed creation and single-line options cleanup)
-read -p "Save this finalized configuration permanently to $CONFIG_FILE? (y/n): " SAVE_PERM
-if [[ "$SAVE_PERM" =~ ^[Yy]$ ]]; then
-    touch "$CONFIG_FILE"
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
-
-    # Completely wipe out older zfs configuration lines
-    sed -i '/options zfs/d' "$CONFIG_FILE"
-
-    # Append clean single-line configuration formatted with spaces
-    echo "options zfs zfs_arc_min=$TARGET_MIN_BYTES zfs_arc_max=$TARGET_MAX_BYTES" >> "$CONFIG_FILE"
-    echo -e "\033[0;32m[SUCCESS] Configuration saved to $CONFIG_FILE\033[0m"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
