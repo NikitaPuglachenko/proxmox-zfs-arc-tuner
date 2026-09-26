@@ -36,6 +36,8 @@ The Smart Recommendation is calculated from the total raw capacity of all active
 - **Recommended Max:** 2× the baseline formula (4× the recommended Min).
 - **RAM Safety Cap:** If the calculated Max exceeds 10% of total host RAM, Max is capped at 10% of host RAM and Min is set to 25% of the capped Max.
 - **Guest Memory:** On Proxmox VE, the memory configured for the running VMs and containers of the node (from `pvesh`) and a reserve for the host (5% of RAM, at least 2 GiB) are subtracted from the RAM. If Max exceeds what is left, Max is limited to it and Min is set to the lowest value (32 MiB), so the ARC can shrink when the guests need memory. Use `--ignore-guests` to skip this.
+  - The configured maximum memory of each guest is used, not its current usage, so VMs with ballooning are counted with the memory they can grow to.
+  - Stopped guests are not counted unless `--include-stopped` is given, e.g. when VMs start later or on demand. Templates are never counted.
 
 The 10% host RAM value is therefore a **safety cap for the recommended ARC maximum**, not the primary sizing formula. When the cap brings Max below the Proxmox guideline, the tuner points it out, and when the guests leave more memory, it suggests limits that fit in it.
 
@@ -81,6 +83,7 @@ Target Limits:
 | `-y`, `--yes` | Answer yes to all questions |
 | `--dry-run` | Show what would be done without changing anything (does not require root) |
 | `--ignore-guests` | Do not take the memory of running VMs and containers into account |
+| `--include-stopped` | Also count stopped VMs and containers (templates are never counted) |
 | `--wait SECONDS` | Seconds to monitor cache eviction after applying (default: 10, `0` to skip) |
 | `--detailed-exitcode` | Exit with `0` when nothing changed (or would change), `2` when something changed (or would change), `1` on errors |
 | `-h`, `--help` / `--version` | Show help / version |
@@ -201,7 +204,7 @@ The analyzer does **not** modify any system configuration.
 Download a released version and verify its checksum:
 
 ```bash
-VERSION=v1.1.0
+VERSION=v1.2.0
 BASE=https://github.com/NikitaPuglachenko/proxmox-zfs-arc-tuner/releases/download/${VERSION}
 curl -fsSL -O "${BASE}/pve-zfs-tuner.sh" -O "${BASE}/pve-zfs-analyzer.sh" -O "${BASE}/SHA256SUMS"
 sha256sum --check SHA256SUMS

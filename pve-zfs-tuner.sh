@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Proxmox VE ZFS ARC Tuner: calculates, applies and persists ZFS ARC limits.
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # System paths, overridable for testing
 ZFS_PARAMS_DIR="${ZFS_PARAMS_DIR:-/sys/module/zfs/parameters}"
@@ -62,6 +62,7 @@ Options:
   -y, --yes             Answer yes to all questions (non-interactive)
   --dry-run             Show what would be done without changing anything
   --ignore-guests       Do not take the memory of running VMs and containers into account
+  --include-stopped     Also count stopped VMs and containers (templates are never counted)
   --wait SECONDS        Seconds to monitor cache eviction after applying (default: 10)
   --detailed-exitcode   Exit with 0 when nothing changed (or would change), 2 when
                         something changed (or would change), 1 on errors
@@ -124,20 +125,23 @@ total_pool_bytes() {
     zpool list -p -H -o size 2>/dev/null | awk '{ sum += $1 } END { printf "%.0f", sum }'
 }
 
-# Prints the memory configured for the running VMs and containers of this node in
-# bytes; fails when pvesh is not available (not a Proxmox VE host)
+# Prints the maximum memory configured for the VMs and containers of this node in
+# bytes: the running ones, or all of them with "all" as the argument; templates are
+# never counted. Fails when pvesh is not available (not a Proxmox VE host)
 guest_memory_bytes() {
     command -v pvesh >/dev/null 2>&1 || return 1
-    local guests
+    local scope="${1:-running}" guests
     guests=$({
         pvesh get /nodes/localhost/qemu --output-format json &&
             echo &&
             pvesh get /nodes/localhost/lxc --output-format json
     } 2>/dev/null) || return 1
-    echo "$guests" | perl -MJSON::PP -ne '
+    echo "$guests" | SCOPE="$scope" perl -MJSON::PP -ne '
         next unless /\S/;
         for my $guest (@{ decode_json($_) }) {
-            $sum += $guest->{maxmem} // 0 if ($guest->{status} // "") eq "running";
+            next if $guest->{template};
+            next unless $ENV{SCOPE} eq "all" || ($guest->{status} // "") eq "running";
+            $sum += $guest->{maxmem} // 0;
         }
         END { printf "%.0f\n", $sum // 0 }
     '
@@ -281,7 +285,7 @@ main() {
     set -euo pipefail
 
     local mode="" persist="ask" dry_run=0 wait_seconds=10 custom_min="" custom_max=""
-    local ignore_guests=0 detailed_exitcode=0
+    local ignore_guests=0 guest_scope="running" detailed_exitcode=0
     ASSUME_YES=0
 
     while [ $# -gt 0 ]; do
@@ -302,6 +306,7 @@ main() {
             -y | --yes) ASSUME_YES=1 ;;
             --dry-run) dry_run=1 ;;
             --ignore-guests) ignore_guests=1 ;;
+            --include-stopped) guest_scope="all" ;;
             --detailed-exitcode) detailed_exitcode=1 ;;
             --wait)
                 wait_seconds="${2:-}"
@@ -330,6 +335,9 @@ main() {
         fi
         mode="custom"
     fi
+    if [ "$ignore_guests" -eq 1 ] && [ "$guest_scope" = "all" ]; then
+        die "--include-stopped cannot be combined with --ignore-guests"
+    fi
     if [ "$mode" = "restore" ]; then
         [ "$persist" != "no" ] || die "--restore cannot be combined with --no-persist"
         persist="yes"
@@ -349,7 +357,7 @@ main() {
     pool=$(total_pool_bytes)
     arc=$(read_arcstat size)
     if [ "$ignore_guests" -eq 0 ]; then
-        guests=$(guest_memory_bytes) || guests=""
+        guests=$(guest_memory_bytes "$guest_scope") || guests=""
     fi
     runtime_min=$(read_param zfs_arc_min)
     runtime_max=$(read_param zfs_arc_max)
@@ -361,18 +369,23 @@ main() {
     runtime_max_text=$([ "$runtime_max" -eq 0 ] && echo "ZFS default ($(format_gib "$(read_arcstat c_max)") GiB)" || echo "$(format_gib "$(read_arcstat c_max)") GiB")
 
     # 2. Recommendation
-    local rec_min rec_max baseline reason reason_text
+    local rec_min rec_max baseline reason reason_text guests_text="running VMs/CTs"
+    [ "$guest_scope" = "all" ] && guests_text="VMs/CTs (including stopped)"
     read -r rec_min rec_max baseline reason <<<"$(recommend_limits "$ram" "$pool" "$guests")"
     case "$reason" in
         formula) reason_text="Min = 50% of formula (2 GiB + 1 GiB/TiB), Max = 2x formula" ;;
         ram_cap) reason_text="Capped to 10% of host RAM (formula exceeded the safe threshold)" ;;
-        guests) reason_text="Limited to the memory left after running VMs/CTs, Min kept low so the ARC can shrink" ;;
+        guests) reason_text="Limited to the memory left after ${guests_text}, Min kept low so the ARC can shrink" ;;
     esac
 
     info "${YELLOW}Current System State:${NC}"
     info "  Host Total RAM:         ${GREEN}$(format_gib "$ram") GiB${NC}"
     if [ -n "$guests" ]; then
-        info "  Running VMs/CTs Memory: ${GREEN}$(format_gib "$guests") GiB${NC} (headroom for ARC: $(format_gib "$(guest_headroom "$ram" "$guests")") GiB)"
+        if [ "$guest_scope" = "all" ]; then
+            info "  All VMs/CTs Memory:     ${GREEN}$(format_gib "$guests") GiB${NC} (including stopped; headroom for ARC: $(format_gib "$(guest_headroom "$ram" "$guests")") GiB)"
+        else
+            info "  Running VMs/CTs Memory: ${GREEN}$(format_gib "$guests") GiB${NC} (headroom for ARC: $(format_gib "$(guest_headroom "$ram" "$guests")") GiB)"
+        fi
     fi
     info "  Total Raw ZFS Storage:  ${GREEN}$(awk -v b="$pool" 'BEGIN { printf "%.2f", b / 1099511627776 }') TiB${NC}"
     info "  Current ARC Footprint:  ${GREEN}$(format_gib "$arc") GiB${NC} (actual RAM used)"
@@ -387,14 +400,14 @@ main() {
     if [ "$rec_max" -lt "$baseline" ]; then
         warn "The recommended Max is below the Proxmox guideline of $(format_gib "$baseline") GiB (2 GiB + 1 GiB per TiB of storage)."
         if [ "$reason" = "guests" ]; then
-            info "  The running VMs and containers leave little memory for the ARC; consider more RAM or less guest memory."
+            info "  The ${guests_text} leave little memory for the ARC; consider more RAM or less guest memory."
         elif [ -n "$guests" ] && [ "$(guest_headroom "$ram" "$guests")" -ge $((rec_max + GIB)) ]; then
             # The 10% cap applies, but the guests leave more memory: suggest limits that fit in it
             local fit_max
             fit_max=$(guest_headroom "$ram" "$guests")
             [ "$fit_max" -le $((baseline * 2)) ] || fit_max=$((baseline * 2))
             fit_max=$(((fit_max / GIB) * GIB))
-            info "  The running VMs and containers leave $(format_gib "$(guest_headroom "$ram" "$guests")") GiB, so larger limits fit:"
+            info "  The ${guests_text} leave $(format_gib "$(guest_headroom "$ram" "$guests")") GiB, so larger limits fit:"
             info "  --min $(((fit_max / 4) / MIB))M --max $((fit_max / GIB))G"
         else
             info "  Consider more RAM, or custom limits if the host can spare the memory."

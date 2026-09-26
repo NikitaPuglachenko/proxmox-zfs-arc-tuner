@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Proxmox VE ZFS ARC Analyzer: measures ARC efficiency and PSI pressure (read-only).
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # System paths, overridable for testing
 ARCSTATS_FILE="${ARCSTATS_FILE:-/proc/spl/kstat/zfs/arcstats}"
