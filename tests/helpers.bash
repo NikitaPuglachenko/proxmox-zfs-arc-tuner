@@ -40,6 +40,11 @@ STUB
 #!/usr/bin/env bash
 echo "$*" >>"$FAKE_INITRAMFS_LOG"
 STUB
+    export FAKE_LOGGER_LOG="${FIXTURE}/logger.log"
+    cat >"${FIXTURE}/bin/logger" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >>"$FAKE_LOGGER_LOG"
+STUB
     chmod +x "${FIXTURE}/bin/"*
     export PATH="${FIXTURE}/bin:${PATH}"
 
@@ -61,4 +66,19 @@ write_arcstats() {
             printf '%-32s4    %s\n' "${pair%%=*}" "${pair#*=}"
         done
     } >"$ARCSTATS_FILE"
+}
+
+# fake_pvesh <qemu json> <lxc json>: makes this a Proxmox VE host with these guests
+fake_pvesh() {
+    printf '%s' "$1" >"${FIXTURE}/qemu.json"
+    printf '%s' "$2" >"${FIXTURE}/lxc.json"
+    cat >"${FIXTURE}/bin/pvesh" <<STUB
+#!/usr/bin/env bash
+case "\$2" in
+    */qemu) cat "${FIXTURE}/qemu.json" ;;
+    */lxc) cat "${FIXTURE}/lxc.json" ;;
+    *) exit 1 ;;
+esac
+STUB
+    chmod +x "${FIXTURE}/bin/pvesh"
 }
