@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-26
+
+### Added
+
+- Tuner: `--include-stopped` also counts the memory of stopped VMs and containers, for guests that start later or on demand
+
+### Changed
+
+- Tuner: VM and container templates are never counted as guest memory
+- README: the guest memory is the configured maximum, so VMs with ballooning are counted with the memory they can grow to
+
 ## [1.1.0] - 2026-09-26
 
 ### Added

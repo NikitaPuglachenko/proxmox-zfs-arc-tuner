@@ -410,3 +410,34 @@ zfs_arc_max=$((4 * GIB))" ]
     [[ "$output" == *"leave 12.80 GiB, so larger limits fit:"* ]]
     [[ "$output" == *"--min 3072M --max 12G"* ]]
 }
+
+@test "guests: templates are never counted" {
+    fake_pvesh '[{"status":"running","maxmem":'$((2 * GIB))'},{"status":"stopped","template":1,"maxmem":'$((8 * GIB))'}]' '[]'
+    [ "$(guest_memory_bytes)" = $((2 * GIB)) ]
+    [ "$(guest_memory_bytes all)" = $((2 * GIB)) ]
+}
+
+@test "guests: stopped VMs and containers are counted with all" {
+    fake_pvesh '[{"status":"running","maxmem":'$((2 * GIB))'},{"status":"stopped","maxmem":'$((8 * GIB))'}]' \
+        '[{"status":"stopped","maxmem":'$((1 * GIB))'}]'
+    [ "$(guest_memory_bytes running)" = $((2 * GIB)) ]
+    [ "$(guest_memory_bytes all)" = $((11 * GIB)) ]
+}
+
+@test "--include-stopped takes stopped guests into account" {
+    set_storage
+    write_meminfo $((64 * GIB))
+    fake_pvesh '[{"status":"running","maxmem":'$((8 * GIB))'},{"status":"stopped","maxmem":'$((48 * GIB))'}]' '[]'
+    run "$TUNER" --recommended --dry-run --include-stopped
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"All VMs/CTs Memory:     56.00 GiB (including stopped; headroom for ARC: 4.80 GiB)"* ]]
+    [[ "$output" == *"Limited to the memory left after VMs/CTs (including stopped)"* ]]
+    run "$TUNER" --recommended --dry-run
+    [[ "$output" == *"Running VMs/CTs Memory: 8.00 GiB"* ]]
+}
+
+@test "--include-stopped cannot be combined with --ignore-guests" {
+    run "$TUNER" --dry-run --include-stopped --ignore-guests
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"cannot be combined"* ]]
+}
