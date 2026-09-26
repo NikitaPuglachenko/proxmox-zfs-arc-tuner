@@ -399,3 +399,14 @@ zfs_arc_max=$((4 * GIB))" ]
     run "$TUNER" --restore --no-persist
     [ "$status" -eq 1 ]
 }
+
+@test "larger limits are suggested when the 10% cap applies but the guests leave more memory" {
+    set_storage
+    export FAKE_POOL_BYTES=$((8 * TIB))
+    write_meminfo $((64 * GIB))
+    # 48 GiB for guests and 3.2 GiB for the host leave 12.8 GiB
+    fake_pvesh '[{"status":"running","maxmem":'$((48 * GIB))'}]' '[]'
+    run "$TUNER" --recommended --dry-run
+    [[ "$output" == *"leave 12.80 GiB, so larger limits fit:"* ]]
+    [[ "$output" == *"--min 3072M --max 12G"* ]]
+}

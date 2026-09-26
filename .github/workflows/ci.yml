@@ -9,13 +9,21 @@ permissions:
   contents: read
 
 jobs:
-  shellcheck:
-    name: ShellCheck
+  lint:
+    name: ShellCheck and shfmt
     runs-on: ubuntu-latest
+    env:
+      SHFMT_VERSION: v3.14.1
     steps:
       - uses: actions/checkout@v7
       - run: shellcheck --version
-      - run: shellcheck -x pve-zfs-tuner.sh pve-zfs-analyzer.sh
+      - run: shellcheck -x pve-zfs-tuner.sh pve-zfs-analyzer.sh tests/integration.sh
+      - name: Install shfmt
+        run: |
+          sudo curl -fsSLo /usr/local/bin/shfmt "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          sudo chmod +x /usr/local/bin/shfmt
+      # Formatting settings are in .editorconfig
+      - run: shfmt --diff .
 
   test:
     name: Tests

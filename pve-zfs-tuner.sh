@@ -388,6 +388,14 @@ main() {
         warn "The recommended Max is below the Proxmox guideline of $(format_gib "$baseline") GiB (2 GiB + 1 GiB per TiB of storage)."
         if [ "$reason" = "guests" ]; then
             info "  The running VMs and containers leave little memory for the ARC; consider more RAM or less guest memory."
+        elif [ -n "$guests" ] && [ "$(guest_headroom "$ram" "$guests")" -ge $((rec_max + GIB)) ]; then
+            # The 10% cap applies, but the guests leave more memory: suggest limits that fit in it
+            local fit_max
+            fit_max=$(guest_headroom "$ram" "$guests")
+            [ "$fit_max" -le $((baseline * 2)) ] || fit_max=$((baseline * 2))
+            fit_max=$(((fit_max / GIB) * GIB))
+            info "  The running VMs and containers leave $(format_gib "$(guest_headroom "$ram" "$guests")") GiB, so larger limits fit:"
+            info "  --min $(((fit_max / 4) / MIB))M --max $((fit_max / GIB))G"
         else
             info "  Consider more RAM, or custom limits if the host can spare the memory."
         fi
